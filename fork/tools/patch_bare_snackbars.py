@@ -304,6 +304,83 @@ def inject_manifest(manifest: Path) -> None:
     manifest.write_text(text, encoding="utf-8")
 
 
+def _is_dex_name(name: str) -> bool:
+    return bool(re.fullmatch(r"classes\d*\.dex", name))
+
+
+def assemble_preserving_resources(
+    original_apk: Path, rebuilt_apk: Path, out_apk: Path
+) -> None:
+    """Build final APK from upstream bytes + apktool overlay.
+
+    Chromium/Bare resources break under apktool decode/rebuild (layouts become
+    APKTOOL_DUMMYVAL_*, UrlBar float attrs null → instant launch crash). Keep
+    resources.arsc/res/lib/assets from the original APK. Overlay only
+    AndroidManifest.xml and classes*.dex from the apktool rebuild. Drop META-INF
+    so the CI signer can re-sign.
+    """
+    with zipfile.ZipFile(rebuilt_apk, "r") as rebuilt:
+        overlay_names = [
+            n
+            for n in rebuilt.namelist()
+            if n == "AndroidManifest.xml" or _is_dex_name(n)
+        ]
+        if "AndroidManifest.xml" not in overlay_names:
+            raise SystemExit("rebuilt apk missing AndroidManifest.xml")
+        if not any(_is_dex_name(n) for n in overlay_names):
+            raise SystemExit("rebuilt apk missing classes*.dex")
+        overlay_blobs = {n: rebuilt.read(n) for n in overlay_names}
+
+    overlay_set = set(overlay_names)
+    copied = 0
+    with zipfile.ZipFile(original_apk, "r") as orig, zipfile.ZipFile(
+        out_apk, "w"
+    ) as out:
+        orig_names = set(orig.namelist())
+        for info in orig.infolist():
+            name = info.filename
+            if name.endswith("/") or name.startswith("META-INF/"):
+                continue
+            if name in overlay_set:
+                continue
+            new_info = zipfile.ZipInfo(filename=name, date_time=info.date_time)
+            new_info.compress_type = info.compress_type
+            new_info.comment = info.comment
+            new_info.extra = info.extra
+            new_info.create_system = info.create_system
+            new_info.external_attr = info.external_attr
+            out.writestr(new_info, orig.read(name))
+            copied += 1
+
+        for name in sorted(overlay_names):
+            if name in orig_names:
+                src = orig.getinfo(name)
+                new_info = zipfile.ZipInfo(filename=name, date_time=src.date_time)
+                new_info.compress_type = src.compress_type
+                new_info.external_attr = src.external_attr
+            else:
+                new_info = zipfile.ZipInfo(filename=name)
+                new_info.compress_type = zipfile.ZIP_DEFLATED
+            out.writestr(new_info, overlay_blobs[name])
+
+    with zipfile.ZipFile(original_apk, "r") as orig, zipfile.ZipFile(
+        out_apk, "r"
+    ) as final:
+        if orig.read("resources.arsc") != final.read("resources.arsc"):
+            raise SystemExit("resources.arsc changed after assemble (abort)")
+        if final.read("AndroidManifest.xml") == orig.read("AndroidManifest.xml"):
+            raise SystemExit("AndroidManifest.xml was not replaced (abort)")
+        final_dex = {n for n in final.namelist() if _is_dex_name(n)}
+        if not final_dex >= {n for n in overlay_names if _is_dex_name(n)}:
+            raise SystemExit(f"missing overlaid dex in final apk: {final_dex}")
+
+    print(
+        f"assembled {out_apk} preserving upstream resources "
+        f"(copied={copied}, overlaid={len(overlay_names)})",
+        flush=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk", type=Path, required=True)
@@ -428,7 +505,10 @@ def main() -> int:
     shutil.copy2(settings_dex, apktool_dir / settings_name)
     print(f"added {settings_name} with settings activity", flush=True)
 
-    unsigned = work / "unsigned.apk"
+    # apktool rebuild is only used as a source of binary AndroidManifest.xml +
+    # patched dex; its re-encoded resources.arsc/res are discarded (see
+    # assemble_preserving_resources).
+    apktool_unsigned = work / "apktool-unsigned.apk"
     run(
         [
             "java",
@@ -437,12 +517,12 @@ def main() -> int:
             "b",
             str(apktool_dir),
             "-o",
-            str(unsigned),
+            str(apktool_unsigned),
         ]
     )
-    if not unsigned.is_file():
-        raise SystemExit("apktool build did not produce unsigned.apk")
-    shutil.copy2(unsigned, args.out)
+    if not apktool_unsigned.is_file():
+        raise SystemExit("apktool build did not produce apktool-unsigned.apk")
+    assemble_preserving_resources(args.apk, apktool_unsigned, args.out)
     print(f"wrote unsigned patched apk {args.out}", flush=True)
     return 0
 
