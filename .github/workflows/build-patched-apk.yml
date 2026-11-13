@@ -135,8 +135,7 @@ jobs:
             --ks work/fork.keystore \
             --ksAlias "$KEY_ALIAS" \
             --ksPass "$KEYSTORE_PASSWORD" \
-            --ksKeyPass "$KEYSTORE_PASSWORD" \
-            --overwrite
+            --ksKeyPass "$KEYSTORE_PASSWORD"
           SIGNED=$(find work/signed -type f -name '*.apk' ! -name '*-unsigned*' | head -n1)
           if [[ -z "$SIGNED" ]]; then
             echo "signed apk not found" >&2
