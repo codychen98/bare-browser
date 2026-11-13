@@ -1,5 +1,7 @@
 {
-  "tab_close_undo_seconds": 0,
-  "fullscreen_exit_seconds": 0,
-  "comment": "Use 0 to suppress, or 1/2 for a short display. CI workflow_dispatch can override."
+  "defaults": {
+    "hide_fullscreen_exit": false,
+    "hide_tab_close_undo": false
+  },
+  "comment": "Runtime toggles (default = official Bare behavior). Change them in the 'Bare snackbar settings' launcher icon after install. Prefs file: bare_fork_snackbars"
 }

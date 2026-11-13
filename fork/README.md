@@ -1,22 +1,25 @@
 # Fork overlays (codychen98/bare-browser)
 
-Custom changes that must not collide with upstream BareBrowser patches.
+Custom changes kept out of upstream BareBrowser `patches/`.
 
-## Snackbar policy
+## Snackbar toggles
 
-`snackbar-policy.json` controls how long these native bars stay visible:
+Patched APKs add a second launcher icon: **Bare snackbar settings**.
 
-- Tab-close Undo (`UMA_TAB_CLOSE_UNDO` / `ALL` / `MULTIPLE`)
-- Fullscreen exit notice (`UMA_EXCLUSIVE_ACCESS_BUBBLE`)
+| Setting | Default | Effect when enabled |
+| --- | --- | --- |
+| Hide fullscreen exit notice | off (stock) | Suppresses the “To exit full screen…” bar |
+| Hide tab-close Undo bar | off (stock) | Suppresses “Closed … / Undo” (still commits the close) |
 
-`seconds: 0` suppresses the bar (commits pending undo via `onDismissNoAction`).
-`seconds: 1` or `2` shows it briefly and bypasses Chromium's accessibility duration floor.
+Prefs live in `SharedPreferences` file `bare_fork_snackbars`.
 
 ## CI
 
-GitHub Actions downloads each Bare release APK, patches `SnackbarManager.showSnackbar` /
-`getDuration` in the DEX (R8 names are discovered each build), resigns with the fork
-keystore, and publishes a release asset.
+On each upstream Bare release (or manual dispatch), Actions:
 
-Package id stays `org.barebrowser`. Signature is the fork's, so install requires
-uninstalling official Bare once; later fork builds update in place and keep data.
+1. Downloads the official arm64 APK  
+2. Patches `SnackbarManager.showSnackbar` to honor the toggles  
+3. Injects the settings activity  
+4. Resigns with this fork’s keystore and publishes `patched-<tag>`
+
+Package id stays `org.barebrowser`. Uninstall official Bare once before the first fork install; later fork builds update in place and keep data.

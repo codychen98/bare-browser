@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Patch Bare/Chromium Android APK snackbar durations for tab-close undo and
-fullscreen exit notice.
+"""Patch a Bare Android APK so snackbar notices can be toggled off at runtime.
 
-Discovers R8-obfuscated SnackbarManager via the "Snackbar.Shown" histogram
-string, then rewrites showSnackbar + getDuration so policy seconds apply even
-when accessibility services would otherwise stretch timeouts.
+Default behavior matches official Bare (notices still show). Users open the
+"Bare snackbar settings" launcher entry and enable:
+  - hide_fullscreen_exit
+  - hide_tab_close_undo
+stored in SharedPreferences file bare_fork_snackbars.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import shutil
 import subprocess
@@ -19,27 +19,14 @@ import zipfile
 from pathlib import Path
 
 
-TAB_CLOSE_IDS = (11, 12, 30)  # UMA_TAB_CLOSE_UNDO / ALL / MULTIPLE
-FULLSCREEN_ID = 87  # UMA_EXCLUSIVE_ACCESS_BUBBLE
+PREF_FILE = "bare_fork_snackbars"
+KEY_FULLSCREEN = "hide_fullscreen_exit"
+KEY_UNDO = "hide_tab_close_undo"
 
 
 def run(cmd: list[str], **kwargs) -> None:
-    print("+", " ".join(cmd), flush=True)
+    print("+", " ".join(str(c) for c in cmd), flush=True)
     subprocess.run(cmd, check=True, **kwargs)
-
-
-def load_policy(path: Path, tab_override: int | None, fs_override: int | None) -> tuple[int, int]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    tab = int(data.get("tab_close_undo_seconds", 0))
-    fs = int(data.get("fullscreen_exit_seconds", 0))
-    if tab_override is not None:
-        tab = tab_override
-    if fs_override is not None:
-        fs = fs_override
-    for name, value in (("tab_close_undo_seconds", tab), ("fullscreen_exit_seconds", fs)):
-        if value not in (0, 1, 2):
-            raise SystemExit(f"{name} must be 0, 1, or 2 (got {value})")
-    return tab, fs
 
 
 def find_dex_with_marker(apk: Path, marker: bytes) -> str:
@@ -51,14 +38,23 @@ def find_dex_with_marker(apk: Path, marker: bytes) -> str:
     raise SystemExit(f"marker {marker!r} not found in any classes*.dex")
 
 
+def next_dex_name(apk_dir: Path) -> str:
+    existing = []
+    for p in apk_dir.glob("classes*.dex"):
+        m = re.fullmatch(r"classes(\d*)\.dex", p.name)
+        if not m:
+            continue
+        existing.append(1 if m.group(1) == "" else int(m.group(1)))
+    n = max(existing) + 1 if existing else 2
+    return "classes.dex" if n == 1 else f"classes{n}.dex"
+
+
 def discover_manager(
     smali_root: Path,
-) -> tuple[Path, str, str, str, str, str, str, str]:
-    """Return manager path + type names/fields needed to patch show/getDuration."""
+) -> tuple[Path, str, str, str, str, str, str, str, str]:
     manager_file = None
     for path in smali_root.rglob("*.smali"):
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if '"Snackbar.Shown"' in text:
+        if '"Snackbar.Shown"' in path.read_text(encoding="utf-8", errors="replace"):
             manager_file = path
             break
     if manager_file is None:
@@ -77,30 +73,29 @@ def discover_manager(
         raise SystemExit("could not discover snackbar identifier field")
     snackbar_type, id_field = id_m.group(1), id_m.group(2)
 
-    snackbar_file = smali_root / f"{snackbar_type}.smali"
-    if not snackbar_file.is_file():
-        candidates = list(smali_root.rglob(f"{snackbar_type.split('/')[-1]}.smali"))
-        if not candidates:
-            raise SystemExit(f"missing snackbar smali for {snackbar_type}")
-        snackbar_file = candidates[0]
-    s_text = snackbar_file.read_text(encoding="utf-8", errors="replace")
-
-    # Duration field from getDuration: first iget of int from p0 after method start near 0xbb8
-    dur_window_m = re.search(
-        r"\.method public static \w+\(L[^;]+;\)I\n[\s\S]*?0xbb8[\s\S]*?\n\.end method",
+    activity_m = re.search(
+        r"\.field public(?: final)? (\w+):Landroidx/fragment/app/FragmentActivity;",
         text,
     )
-    if not dur_window_m:
-        raise SystemExit("could not locate getDuration for duration field discovery")
-    dur_iget = re.search(
-        rf"iget[^\n]* p0, L{re.escape(snackbar_type)};->(\w+):I",
-        dur_window_m.group(0),
+    if not activity_m:
+        activity_m = re.search(
+            r"\.field public(?: final)? (\w+):Landroid/app/Activity;",
+            text,
+        )
+    if not activity_m:
+        raise SystemExit("could not discover SnackbarManager activity field")
+    activity_field = activity_m.group(1)
+    activity_type = (
+        "androidx/fragment/app/FragmentActivity"
+        if "FragmentActivity" in activity_m.group(0)
+        else "android/app/Activity"
     )
-    if not dur_iget:
-        raise SystemExit("could not discover snackbar duration field")
-    duration_field = dur_iget.group(1)
 
-    # Dismiss path: invoke-interface ..., LCtrl;->b(Object) with snackbar controller + actionData
+    snackbar_file = smali_root / f"{snackbar_type}.smali"
+    if not snackbar_file.is_file():
+        snackbar_file = next(smali_root.rglob(f"{snackbar_type.split('/')[-1]}.smali"))
+    s_text = snackbar_file.read_text(encoding="utf-8", errors="replace")
+
     dismiss_m = re.search(
         rf"iget-object (\w+), (\w+), L{re.escape(snackbar_type)};->(\w+):L([^;]+);\n"
         rf"[\s\S]{{0,200}}?"
@@ -114,7 +109,6 @@ def discover_manager(
         controller_type = dismiss_m.group(4)
         action_field = dismiss_m.group(6)
     else:
-        # Fallback: first custom-typed field + java.lang.Object field on snackbar
         controller_field = None
         controller_type = None
         for m in re.finditer(r"\.field public(?: final)? (\w+):L([^;]+);", s_text):
@@ -133,8 +127,8 @@ def discover_manager(
 
     print(
         f"discovered manager=L{manager_type}; snackbar=L{snackbar_type}; "
-        f"id={id_field} duration={duration_field} controller={controller_field}:"
-        f"L{controller_type}; action={action_field}",
+        f"id={id_field} activity={activity_field} controller={controller_field} "
+        f"action={action_field}",
         flush=True,
     )
     return (
@@ -142,92 +136,79 @@ def discover_manager(
         manager_type,
         snackbar_type,
         id_field,
-        duration_field,
+        activity_field,
+        activity_type,
         controller_field,
         controller_type,
         action_field,
     )
 
 
-def find_show_and_duration_methods(text: str) -> tuple[str, str]:
+def find_show_method(text: str) -> str:
     show_m = re.search(
         r"(\.method public final l\(L[^;]+;\)V\n[\s\S]*?\n\.end method)",
         text,
     )
     if not show_m:
-        # some builds may not use name 'l' — find method containing Snackbar.Shown
         show_m = re.search(
             r"(\.method[^\n]*\n(?:.*\n)*?[^\n]*Snackbar\.Shown[\s\S]*?\n\.end method)",
             text,
         )
     if not show_m:
         raise SystemExit("could not find showSnackbar method")
-
-    dur_m = re.search(
-        r"(\.method public static \w+\(L[^;]+;\)I\n[\s\S]*?0xbb8[\s\S]*?AccessibilityState[\s\S]*?\n\.end method)",
-        text,
-    )
-    if not dur_m:
-        raise SystemExit("could not find getDuration method (0xbb8 + AccessibilityState)")
-    return show_m.group(1), dur_m.group(1)
+    return show_m.group(1)
 
 
 def build_show_prefix(
+    manager_type: str,
     snackbar_type: str,
     id_field: str,
-    duration_field: str,
+    activity_field: str,
+    activity_type: str,
     controller_field: str,
     controller_type: str,
     action_field: str,
-    tab_ms: int,
-    fs_ms: int,
 ) -> str:
-    """Smali inserted immediately after the activity-foreground early-return guard."""
+    # Defaults are false => stock Bare behavior unless the user enables a toggle.
     return f"""
-    # [bare-fork] snackbar policy tab_ms={tab_ms} fs_ms={fs_ms}
+    # [bare-fork] optional snackbar suppression via SharedPreferences
     iget v0, p1, L{snackbar_type};->{id_field}:I
 
     const/16 v1, 0xb
-    if-eq v0, v1, :bare_not_tab_close_undo
+    if-eq v0, v1, :bare_not_tab_11
+    const-string v2, "{KEY_UNDO}"
+    goto :bare_check_pref
 
-    goto :bare_handle_tab_close
-
-    :bare_not_tab_close_undo
+    :bare_not_tab_11
     const/16 v1, 0xc
-    if-eq v0, v1, :bare_not_tab_close_all
+    if-eq v0, v1, :bare_not_tab_12
+    const-string v2, "{KEY_UNDO}"
+    goto :bare_check_pref
 
-    goto :bare_handle_tab_close
-
-    :bare_not_tab_close_all
+    :bare_not_tab_12
     const/16 v1, 0x1e
-    if-eq v0, v1, :bare_not_tab_close_multi
+    if-eq v0, v1, :bare_not_tab_30
+    const-string v2, "{KEY_UNDO}"
+    goto :bare_check_pref
 
-    goto :bare_handle_tab_close
-
-    :bare_not_tab_close_multi
+    :bare_not_tab_30
     const/16 v1, 0x57
     if-eq v0, v1, :bare_after_policy
+    const-string v2, "{KEY_FULLSCREEN}"
+    goto :bare_check_pref
 
-    goto :bare_handle_fullscreen
+    :bare_check_pref
+    iget-object v0, p0, L{manager_type};->{activity_field}:L{activity_type};
+    const-string v1, "{PREF_FILE}"
+    const/4 v3, 0x0
+    invoke-virtual {{v0, v1, v3}}, Landroid/content/Context;->getSharedPreferences(Ljava/lang/String;I)Landroid/content/SharedPreferences;
+    move-result-object v0
+    invoke-interface {{v0, v2, v3}}, Landroid/content/SharedPreferences;->getBoolean(Ljava/lang/String;Z)Z
+    move-result v0
+    if-eqz v0, :bare_after_policy
 
-    :bare_handle_tab_close
-    const/16 v1, {tab_ms}
-    if-lez v1, :bare_suppress
-
-    iput v1, p1, L{snackbar_type};->{duration_field}:I
-    goto :bare_after_policy
-
-    :bare_handle_fullscreen
-    const/16 v1, {fs_ms}
-    if-lez v1, :bare_suppress
-
-    iput v1, p1, L{snackbar_type};->{duration_field}:I
-    goto :bare_after_policy
-
-    :bare_suppress
     iget-object v0, p1, L{snackbar_type};->{controller_field}:L{controller_type};
     if-eqz v0, :bare_return
-
     iget-object v1, p1, L{snackbar_type};->{action_field}:Ljava/lang/Object;
     invoke-interface {{v0, v1}}, L{controller_type};->b(Ljava/lang/Object;)V
 
@@ -241,13 +222,16 @@ def build_show_prefix(
 def patch_show_method(method: str, prefix: str) -> str:
     if "[bare-fork]" in method:
         raise SystemExit("showSnackbar already patched")
-    # After foreground guard: iget-boolean ..., if-eqz ..., then our code
+    # Inject uses v0-v3 before the original body reloads them.
+    regs_m = re.search(r"\.registers (\d+)", method)
+    if regs_m and int(regs_m.group(1)) < 6:
+        method = re.sub(r"\.registers \d+", ".registers 6", method, count=1)
+
     m = re.search(
         r"(iget-boolean [^\n]+\n\n(?:[ \t]*\.line[^\n]*\n\n)*[ \t]*if-eqz [^\n]+\n)",
         method,
     )
     if not m:
-        # looser: first if-eqz after method start
         m = re.search(r"(if-eqz [^\n]+\n)", method)
         if not m:
             raise SystemExit("could not find early-return guard in showSnackbar")
@@ -257,145 +241,119 @@ def patch_show_method(method: str, prefix: str) -> str:
     return method[:insert_at] + prefix + method[insert_at:]
 
 
-def patch_duration_method(
-    method: str,
-    snackbar_type: str,
-    id_field: str,
-    duration_field: str,
-) -> str:
-    if "[bare-fork]" in method:
-        raise SystemExit("getDuration already patched")
-    # Replace body with policy-aware version that still falls back to original
-    # by jumping into the original first instruction after our check.
-    m = re.match(r"(\.method[^\n]+\n[ \t]*\.registers[^\n]+\n)", method)
-    if not m:
-        raise SystemExit("bad getDuration header")
-    header = m.group(1)
-    rest = method[m.end() :]
-    inject = f"""
-    # [bare-fork] honor baked duration for tab-close / fullscreen ids (bypass a11y floor)
-    iget v0, p0, L{snackbar_type};->{id_field}:I
-
-    const/16 v1, 0xb
-    if-eq v0, v1, :bare_dur_not_11
-    goto :bare_dur_forced
-
-    :bare_dur_not_11
-    const/16 v1, 0xc
-    if-eq v0, v1, :bare_dur_not_12
-    goto :bare_dur_forced
-
-    :bare_dur_not_12
-    const/16 v1, 0x1e
-    if-eq v0, v1, :bare_dur_not_30
-    goto :bare_dur_forced
-
-    :bare_dur_not_30
-    const/16 v1, 0x57
-    if-eq v0, v1, :bare_dur_original
-    goto :bare_dur_forced
-
-    :bare_dur_forced
-    iget v0, p0, L{snackbar_type};->{duration_field}:I
-    if-lez v0, :bare_dur_original
-    return v0
-
-    :bare_dur_original
-"""
-    # Ensure registers >= 3 (p0 + v0 + v1). Static method with 1 param.
-    regs_m = re.search(r"\.registers (\d+)", header)
-    if regs_m and int(regs_m.group(1)) < 3:
-        header = re.sub(r"\.registers \d+", ".registers 3", header)
-    return header + inject + rest
-
-
-def patch_manager_smali(
+def patch_manager(
     manager_file: Path,
+    manager_type: str,
     snackbar_type: str,
     id_field: str,
-    duration_field: str,
+    activity_field: str,
+    activity_type: str,
     controller_field: str,
     controller_type: str,
     action_field: str,
-    tab_seconds: int,
-    fs_seconds: int,
 ) -> None:
     text = manager_file.read_text(encoding="utf-8")
-    show, duration = find_show_and_duration_methods(text)
+    show = find_show_method(text)
     prefix = build_show_prefix(
-        snackbar_type=snackbar_type,
-        id_field=id_field,
-        duration_field=duration_field,
-        controller_field=controller_field,
-        controller_type=controller_type,
-        action_field=action_field,
-        tab_ms=tab_seconds * 1000,
-        fs_ms=fs_seconds * 1000,
+        manager_type,
+        snackbar_type,
+        id_field,
+        activity_field,
+        activity_type,
+        controller_field,
+        controller_type,
+        action_field,
     )
     new_show = patch_show_method(show, prefix)
-    new_duration = patch_duration_method(
-        duration, snackbar_type, id_field, duration_field
-    )
-    if show not in text or duration not in text:
-        raise SystemExit("internal: method text mismatch")
-    text = text.replace(show, new_show, 1).replace(duration, new_duration, 1)
-    manager_file.write_text(text, encoding="utf-8")
+    if show not in text:
+        raise SystemExit("internal: show method mismatch")
+    manager_file.write_text(text.replace(show, new_show, 1), encoding="utf-8")
     print(f"patched {manager_file}", flush=True)
 
 
-def rebuild_apk(
-    src_apk: Path,
-    dex_name: str,
-    new_dex: Path,
-    out_apk: Path,
-) -> None:
-    if out_apk.exists():
-        out_apk.unlink()
-    with zipfile.ZipFile(src_apk, "r") as zin, zipfile.ZipFile(
-        out_apk,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-    ) as zout:
-        for info in zin.infolist():
-            data = zin.read(info.filename)
-            if info.filename.startswith("META-INF/"):
-                continue
-            if info.filename == dex_name:
-                data = new_dex.read_bytes()
-            # keep stored for stored entries (native libs often stored)
-            if info.compress_type == zipfile.ZIP_STORED:
-                zout.writestr(info, data, compress_type=zipfile.ZIP_STORED)
-            else:
-                zout.writestr(info.filename, data, compress_type=zipfile.ZIP_DEFLATED)
+def inject_manifest(manifest: Path) -> None:
+    text = manifest.read_text(encoding="utf-8")
+    # aapt2 frameworks shipped with apktool lag new platform attrs; drop them so
+    # rebuild succeeds. Runtime behavior we care about does not depend on these.
+    text = re.sub(r'\s+\w+:zygotePreloadNativeLib="[^"]*"', "", text)
+    text = re.sub(r'\s+\w+:nativeService="[^"]*"', "", text)
+
+    if "org.barebrowser.fork.SnackbarSettingsActivity" not in text:
+        prefix = "android"
+        m = re.search(
+            r'xmlns:(\w+)="http://schemas.android.com/apk/res/android"', text
+        )
+        if m:
+            prefix = m.group(1)
+        a = prefix
+        block = f"""
+        <activity {a}:name="org.barebrowser.fork.SnackbarSettingsActivity" {a}:exported="true" {a}:label="Bare snackbar settings" {a}:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+            <intent-filter>
+                <action {a}:name="android.intent.action.MAIN" />
+                <category {a}:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+"""
+        if "</application>" not in text:
+            raise SystemExit("no </application> in manifest")
+        text = text.replace("</application>", block + "    </application>", 1)
+        print(f"injected settings activity into {manifest}", flush=True)
+    else:
+        print("manifest already has settings activity", flush=True)
+
+    manifest.write_text(text, encoding="utf-8")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk", type=Path, required=True)
-    parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--baksmali-cp", required=True, help="classpath for baksmali Main")
-    parser.add_argument("--smali-cp", required=True, help="classpath for smali Main")
+    parser.add_argument("--baksmali-cp", required=True)
+    parser.add_argument("--smali-cp", required=True)
+    parser.add_argument("--apktool-jar", type=Path, required=True)
+    parser.add_argument(
+        "--overlay-smali",
+        type=Path,
+        required=True,
+        help="Directory of fork settings smali (org/barebrowser/fork/...)",
+    )
+    # retained for workflow compat; ignored (runtime toggles replace bake-in policy)
+    parser.add_argument("--policy", type=Path, default=None)
     parser.add_argument("--tab-seconds", type=int, default=None)
     parser.add_argument("--fullscreen-seconds", type=int, default=None)
     args = parser.parse_args()
-
-    tab_s, fs_s = load_policy(args.policy, args.tab_seconds, args.fullscreen_seconds)
-    print(f"policy tab_close={tab_s}s fullscreen={fs_s}s", flush=True)
 
     work = args.work
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True)
 
-    dex_name = find_dex_with_marker(args.apk, b"Snackbar.Shown")
-    print(f"using {dex_name}", flush=True)
-    dex_path = work / dex_name
-    with zipfile.ZipFile(args.apk) as zf:
-        dex_path.write_bytes(zf.read(dex_name))
+    apktool_dir = work / "apktool"
+    run(
+        [
+            "java",
+            "-jar",
+            str(args.apktool_jar),
+            "d",
+            "-f",
+            "-s",
+            str(args.apk),
+            "-o",
+            str(apktool_dir),
+        ]
+    )
+    inject_manifest(apktool_dir / "AndroidManifest.xml")
 
-    smali_dir = work / "smali"
+    dex_name = find_dex_with_marker(args.apk, b"Snackbar.Shown")
+    print(f"patching {dex_name}", flush=True)
+    dex_path = apktool_dir / dex_name
+    if not dex_path.is_file():
+        # apktool may keep dex under unknown/ in odd layouts; fall back to extract
+        with zipfile.ZipFile(args.apk) as zf:
+            dex_path.write_bytes(zf.read(dex_name))
+
+    smali_dir = work / "smali-main"
     run(
         [
             "java",
@@ -411,27 +369,29 @@ def main() -> int:
 
     (
         manager_file,
-        _manager_type,
+        manager_type,
         snackbar_type,
         id_field,
-        duration_field,
+        activity_field,
+        activity_type,
         controller_field,
         controller_type,
         action_field,
     ) = discover_manager(smali_dir)
-    patch_manager_smali(
+
+    patch_manager(
         manager_file,
+        manager_type,
         snackbar_type,
         id_field,
-        duration_field,
+        activity_field,
+        activity_type,
         controller_field,
         controller_type,
         action_field,
-        tab_s,
-        fs_s,
     )
 
-    out_dex = work / "out.dex"
+    out_dex = work / "patched.dex"
     run(
         [
             "java",
@@ -444,9 +404,44 @@ def main() -> int:
             str(out_dex),
         ]
     )
+    shutil.copy2(out_dex, dex_path)
+
+    # Assemble settings overlay into a new dex
+    overlay_out = work / "overlay-smali"
+    if overlay_out.exists():
+        shutil.rmtree(overlay_out)
+    shutil.copytree(args.overlay_smali, overlay_out)
+    settings_dex = work / "settings.dex"
+    run(
+        [
+            "java",
+            "-cp",
+            args.smali_cp,
+            "org.jf.smali.Main",
+            "a",
+            str(overlay_out),
+            "-o",
+            str(settings_dex),
+        ]
+    )
+    settings_name = next_dex_name(apktool_dir)
+    shutil.copy2(settings_dex, apktool_dir / settings_name)
+    print(f"added {settings_name} with settings activity", flush=True)
 
     unsigned = work / "unsigned.apk"
-    rebuild_apk(args.apk, dex_name, out_dex, unsigned)
+    run(
+        [
+            "java",
+            "-jar",
+            str(args.apktool_jar),
+            "b",
+            str(apktool_dir),
+            "-o",
+            str(unsigned),
+        ]
+    )
+    if not unsigned.is_file():
+        raise SystemExit("apktool build did not produce unsigned.apk")
     shutil.copy2(unsigned, args.out)
     print(f"wrote unsigned patched apk {args.out}", flush=True)
     return 0

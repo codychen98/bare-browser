@@ -7,18 +7,9 @@ on:
         description: "Upstream release tag (e.g. v2.0.3) or 'latest'"
         required: true
         default: "latest"
-      tab_close_undo_seconds:
-        description: "Tab-close Undo duration (0=hide, 1, or 2 seconds). Blank = policy file."
-        required: false
-        default: ""
-      fullscreen_exit_seconds:
-        description: "Fullscreen exit notice duration (0=hide, 1, or 2). Blank = policy file."
-        required: false
-        default: ""
   repository_dispatch:
     types: [bare-release]
   schedule:
-    # Daily check for a newer upstream release than our latest patched tag
     - cron: "42 6 * * *"
 
 permissions:
@@ -91,29 +82,30 @@ jobs:
             -p "${{ steps.rel.outputs.asset }}" -D work
           ls -lh work
 
-      - name: Fetch smali toolchain
+      - name: Fetch tools
         if: steps.skip.outputs.skip != 'true'
-        run: bash fork/tools/fetch_smali_tools.sh "$GITHUB_WORKSPACE/.fork-tools"
+        run: |
+          set -euo pipefail
+          bash fork/tools/fetch_smali_tools.sh "$GITHUB_WORKSPACE/.fork-tools"
+          curl -fsSL -o "$GITHUB_WORKSPACE/.fork-tools/apktool.jar" \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar"
+          curl -fsSL -o "$GITHUB_WORKSPACE/.fork-tools/uber-apk-signer.jar" \
+            "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar"
 
-      - name: Patch snackbars
+      - name: Patch snackbars + settings UI
         if: steps.skip.outputs.skip != 'true'
         run: |
           set -euo pipefail
           BAKSMALI_CP=$(cat "$GITHUB_WORKSPACE/.fork-tools/baksmali.cp")
           SMALI_CP=$(cat "$GITHUB_WORKSPACE/.fork-tools/smali.cp")
-          EXTRA=()
-          TAB="${{ github.event.inputs.tab_close_undo_seconds }}"
-          FS="${{ github.event.inputs.fullscreen_exit_seconds }}"
-          if [[ -n "${TAB:-}" ]]; then EXTRA+=(--tab-seconds "$TAB"); fi
-          if [[ -n "${FS:-}" ]]; then EXTRA+=(--fullscreen-seconds "$FS"); fi
           python3 fork/tools/patch_bare_snackbars.py \
             --apk "work/${{ steps.rel.outputs.asset }}" \
-            --policy fork/snackbar-policy.json \
             --work work/patch \
             --out work/patched-unsigned.apk \
             --baksmali-cp "$BAKSMALI_CP" \
             --smali-cp "$SMALI_CP" \
-            "${EXTRA[@]}"
+            --apktool-jar "$GITHUB_WORKSPACE/.fork-tools/apktool.jar" \
+            --overlay-smali fork/overlay/smali
 
       - name: Decode signing keystore
         if: steps.skip.outputs.skip != 'true'
@@ -129,11 +121,7 @@ jobs:
           fi
           echo "$KEYSTORE_BASE64" | base64 -d > work/fork.keystore
 
-      - name: Set up Android SDK build-tools
-        if: steps.skip.outputs.skip != 'true'
-        uses: android-actions/setup-android@v3
-
-      - name: Zipalign and sign
+      - name: Sign APK
         if: steps.skip.outputs.skip != 'true'
         env:
           KEYSTORE_PASSWORD: ${{ secrets.FORK_KEYSTORE_PASSWORD }}
@@ -141,17 +129,22 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.rel.outputs.tag }}"
-          OUT="work/Bare-${TAG#v}-arm64-v8a-snackbar-patched.apk"
-          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
-          "$BUILD_TOOLS/zipalign" -f -p 4 work/patched-unsigned.apk work/aligned.apk
-          "$BUILD_TOOLS/apksigner" sign \
+          java -jar "$GITHUB_WORKSPACE/.fork-tools/uber-apk-signer.jar" \
+            --apks work/patched-unsigned.apk \
+            --out work/signed \
             --ks work/fork.keystore \
-            --ks-pass "pass:$KEYSTORE_PASSWORD" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --key-pass "pass:$KEYSTORE_PASSWORD" \
-            --out "$OUT" \
-            work/aligned.apk
-          "$BUILD_TOOLS/apksigner" verify --verbose "$OUT"
+            --ksAlias "$KEY_ALIAS" \
+            --ksPass "$KEYSTORE_PASSWORD" \
+            --ksKeyPass "$KEYSTORE_PASSWORD" \
+            --overwrite
+          SIGNED=$(find work/signed -type f -name '*.apk' ! -name '*-unsigned*' | head -n1)
+          if [[ -z "$SIGNED" ]]; then
+            echo "signed apk not found" >&2
+            ls -laR work/signed >&2 || true
+            exit 1
+          fi
+          OUT="work/Bare-${TAG#v}-arm64-v8a-snackbar-patched.apk"
+          cp "$SIGNED" "$OUT"
           echo "apk=$OUT" >> "$GITHUB_ENV"
           sha256sum "$OUT" | tee work/SHA256SUMS.txt
           ls -lh "$OUT"
@@ -164,15 +157,17 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.rel.outputs.tag }}"
           REL="patched-${TAG}"
-          TITLE="Patched Bare ${TAG} (snackbar policy)"
+          TITLE="Patched Bare ${TAG} (snackbar toggles)"
           BODY=$(cat <<EOF
-          Custom build of Bare \`${TAG}\` with adjustable snackbar policy from \`fork/snackbar-policy.json\`.
+          Custom build of Bare \`${TAG}\` with optional snackbar toggles.
 
-          - Package: \`org.barebrowser\` (same as upstream)
+          - Package: \`org.barebrowser\`
+          - Defaults match official Bare (notices still show)
+          - Open the **Bare snackbar settings** launcher icon to hide fullscreen exit and/or tab-close Undo
           - Signed with this fork's CI keystore (not Bare's official key)
-          - **Uninstall official Bare once** before installing; later patched releases update in place and keep data.
+          - **Uninstall official Bare once** before installing; later patched releases update in place
 
-          Source APK: BareBrowser/bare-browser \`${TAG}\` / \`${{ steps.rel.outputs.asset }}\`
+          Source: BareBrowser/bare-browser \`${TAG}\` / \`${{ steps.rel.outputs.asset }}\`
           EOF
           )
           if gh release view "$REL" >/dev/null 2>&1; then
