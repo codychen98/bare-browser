@@ -23,3 +23,9 @@ On each upstream Bare release (or manual dispatch), Actions:
 4. Resigns with this fork’s keystore and publishes `patched-<tag>`
 
 Package id stays `org.barebrowser`. Uninstall official Bare once before the first fork install; later fork builds update in place and keep data.
+
+## Local private files
+
+Use `.bare-fork-local/` at the repo root for notes/secrets you never want committed.
+It is listed in `.gitignore` by this fork. After upstream syncs, confirm that ignore
+line is still present.

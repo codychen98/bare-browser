@@ -16,6 +16,10 @@ local-src/
 phase2-staging/
 account-probe/
 
+# Fork-only local notes/secrets (codychen98/bare-browser). Not used by upstream.
+# Re-check this line after merging upstream if .gitignore conflicts.
+.bare-fork-local/
+
 # Local test notes containing device specifics.
 crash-report-*.md
 
