@@ -1,0 +1,182 @@
+name: Build patched Bare APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Upstream release tag (e.g. v2.0.3) or 'latest'"
+        required: true
+        default: "latest"
+      tab_close_undo_seconds:
+        description: "Tab-close Undo duration (0=hide, 1, or 2 seconds). Blank = policy file."
+        required: false
+        default: ""
+      fullscreen_exit_seconds:
+        description: "Fullscreen exit notice duration (0=hide, 1, or 2). Blank = policy file."
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [bare-release]
+  schedule:
+    # Daily check for a newer upstream release than our latest patched tag
+    - cron: "42 6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-patched-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Resolve upstream release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SRC="${{ github.event.inputs.source || 'latest' }}"
+          if [[ "$SRC" == "latest" || -z "$SRC" ]]; then
+            TAG=$(gh release view -R BareBrowser/bare-browser --json tagName -q .tagName)
+          else
+            TAG="$SRC"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          ASSET=$(gh release view -R BareBrowser/bare-browser "$TAG" --json assets \
+            -q '.assets[].name | select(test("arm64-v8a\\.apk$"))' | head -n1)
+          if [[ -z "$ASSET" ]]; then
+            echo "No arm64 APK on release $TAG" >&2
+            exit 1
+          fi
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "Using $TAG / $ASSET"
+
+      - name: Skip if we already published this upstream tag
+        id: skip
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.rel.outputs.tag }}"
+          OURS="patched-${TAG}"
+          if gh release view "$OURS" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already have $OURS"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download upstream APK
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          gh release download "${{ steps.rel.outputs.tag }}" -R BareBrowser/bare-browser \
+            -p "${{ steps.rel.outputs.asset }}" -D work
+          ls -lh work
+
+      - name: Fetch smali toolchain
+        if: steps.skip.outputs.skip != 'true'
+        run: bash fork/tools/fetch_smali_tools.sh "$GITHUB_WORKSPACE/.fork-tools"
+
+      - name: Patch snackbars
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          BAKSMALI_CP=$(cat "$GITHUB_WORKSPACE/.fork-tools/baksmali.cp")
+          SMALI_CP=$(cat "$GITHUB_WORKSPACE/.fork-tools/smali.cp")
+          EXTRA=()
+          TAB="${{ github.event.inputs.tab_close_undo_seconds }}"
+          FS="${{ github.event.inputs.fullscreen_exit_seconds }}"
+          if [[ -n "${TAB:-}" ]]; then EXTRA+=(--tab-seconds "$TAB"); fi
+          if [[ -n "${FS:-}" ]]; then EXTRA+=(--fullscreen-seconds "$FS"); fi
+          python3 fork/tools/patch_bare_snackbars.py \
+            --apk "work/${{ steps.rel.outputs.asset }}" \
+            --policy fork/snackbar-policy.json \
+            --work work/patch \
+            --out work/patched-unsigned.apk \
+            --baksmali-cp "$BAKSMALI_CP" \
+            --smali-cp "$SMALI_CP" \
+            "${EXTRA[@]}"
+
+      - name: Decode signing keystore
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.FORK_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.FORK_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FORK_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KEYSTORE_BASE64:-}" || -z "${KEYSTORE_PASSWORD:-}" || -z "${KEY_ALIAS:-}" ]]; then
+            echo "Missing FORK_KEYSTORE_BASE64 / FORK_KEYSTORE_PASSWORD / FORK_KEY_ALIAS secrets" >&2
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > work/fork.keystore
+
+      - name: Set up Android SDK build-tools
+        if: steps.skip.outputs.skip != 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Zipalign and sign
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.FORK_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.FORK_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.rel.outputs.tag }}"
+          OUT="work/Bare-${TAG#v}-arm64-v8a-snackbar-patched.apk"
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          "$BUILD_TOOLS/zipalign" -f -p 4 work/patched-unsigned.apk work/aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks work/fork.keystore \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass "pass:$KEYSTORE_PASSWORD" \
+            --out "$OUT" \
+            work/aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose "$OUT"
+          echo "apk=$OUT" >> "$GITHUB_ENV"
+          sha256sum "$OUT" | tee work/SHA256SUMS.txt
+          ls -lh "$OUT"
+
+      - name: Publish GitHub release
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.rel.outputs.tag }}"
+          REL="patched-${TAG}"
+          TITLE="Patched Bare ${TAG} (snackbar policy)"
+          BODY=$(cat <<EOF
+          Custom build of Bare \`${TAG}\` with adjustable snackbar policy from \`fork/snackbar-policy.json\`.
+
+          - Package: \`org.barebrowser\` (same as upstream)
+          - Signed with this fork's CI keystore (not Bare's official key)
+          - **Uninstall official Bare once** before installing; later patched releases update in place and keep data.
+
+          Source APK: BareBrowser/bare-browser \`${TAG}\` / \`${{ steps.rel.outputs.asset }}\`
+          EOF
+          )
+          if gh release view "$REL" >/dev/null 2>&1; then
+            gh release upload "$REL" "$apk" work/SHA256SUMS.txt --clobber
+          else
+            gh release create "$REL" "$apk" work/SHA256SUMS.txt --title "$TITLE" --notes "$BODY"
+          fi

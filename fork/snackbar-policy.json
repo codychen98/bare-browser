@@ -1,0 +1,5 @@
+{
+  "tab_close_undo_seconds": 0,
+  "fullscreen_exit_seconds": 0,
+  "comment": "Use 0 to suppress, or 1/2 for a short display. CI workflow_dispatch can override."
+}
