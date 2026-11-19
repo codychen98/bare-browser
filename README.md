@@ -9,11 +9,11 @@
 Bare removes Google sign-in, browser telemetry and AI features from Chromium. Desktop extensions
 work, and uBlock Origin comes installed.
 
-- Version: `2.0.5`. versionCode `802000515` (arm64) and `802000510`
+- Version: `2.0.7`. versionCode `802000715` (arm64) and `802000710`
   (32-bit arm).
 - Base: Chromium `157.0.8103.78` (commit `4b3d0dab`).
 - Runs on: Android 10 or newer, on arm64 or 32-bit ARM. There is no x86 build.
-- Size: 338 patches, 79,464 insertions and 4,467 deletions across 1,157 files.
+- Size: 346 patches, 79,520 insertions and 4,477 deletions across 1,157 files.
 
 ## What you can do
 
